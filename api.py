@@ -1,0 +1,125 @@
+"""
+api.py — FastAPI backend for the Research Assistant Agent.
+
+Exposes a single POST endpoint:
+    POST /api/research   { topic, thread_id } -> { answer, sources, thread_id }
+
+CORS is enabled so the React frontend (http://localhost:5173) can freely
+communicate with this server (http://localhost:8000).
+
+Run with:
+    uvicorn api:app --reload
+"""
+
+import sys
+
+# Force UTF-8 output so Unicode characters in print() calls don't crash on
+# Windows terminals that default to cp1252 encoding.
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from langchain_core.messages import HumanMessage
+
+from graph import research_graph
+
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="Research Assistant Agent API",
+    description="A LangGraph-powered multi-turn research agent backed by Gemini and Tavily.",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Request / response schemas
+# ---------------------------------------------------------------------------
+
+class ResearchRequest(BaseModel):
+    topic: str
+    thread_id: str
+
+
+class ResearchResponse(BaseModel):
+    answer: str
+    sources: list[str]
+    thread_id: str
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Research Agent API is running."}
+
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+
+@app.post("/api/research", response_model=ResearchResponse)
+def research(req: ResearchRequest):
+    """
+    Execute one research turn for the given topic and thread.
+
+    The thread_id enables LangGraph's MemorySaver to restore conversation
+    state between turns — pass the same thread_id for follow-up questions.
+    """
+    if not req.topic.strip():
+        raise HTTPException(status_code=400, detail="Topic must not be empty.")
+
+    config = {"configurable": {"thread_id": req.thread_id}}
+
+    initial_state = {
+        "messages":            [HumanMessage(content=req.topic)],
+        "topic":               req.topic,
+        "sub_questions":       [],
+        "search_results":      [],
+        "retrieved_docs":      [],
+        "sources":             [],
+        "synthesis":           "",
+        "final_answer":        "",
+        "turn_count":          0,
+        "retry_count":         0,
+        "error_message":       "",
+        "needs_more_research": False,
+    }
+
+    try:
+        final_state = research_graph.invoke(initial_state, config=config)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Agent execution failed: {exc}",
+        )
+
+    answer  = final_state.get("final_answer", "No answer generated.")
+    sources = final_state.get("sources", [])
+
+    return ResearchResponse(
+        answer=answer,
+        sources=sources,
+        thread_id=req.thread_id,
+    )
