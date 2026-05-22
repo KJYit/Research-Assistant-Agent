@@ -55,8 +55,8 @@ A multi-turn AI research agent built with **LangGraph**, **Google Gemini**, and 
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-username/research-agent.git
-cd research-agent
+git clone https://github.com/KJYit/Research-Assistant-Agent.git
+cd Research-Assistant-Agent
 ```
 
 ### 2. Create a virtual environment
@@ -158,7 +158,7 @@ The agent **maintains full conversation history** across turns within the same s
 ## Project Structure
 
 ```
-research_agent/
+Research-Assistant-Agent/
 ├── main.py              # CLI entry point and session management
 ├── api.py               # FastAPI backend entry point
 ├── graph.py             # LangGraph StateGraph definition
@@ -176,9 +176,3 @@ research_agent/
 └── tools/
     └── search_tools.py  # Tavily + TF-IDF retriever implementations
 ```
-
----
-
-## Key Design Decisions
-
-See `writeup.md` for the full architecture write-up including design decisions, trade-offs, and challenges faced.
