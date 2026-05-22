@@ -1,5 +1,7 @@
 # 🔬 Research Assistant Agent
 
+🚀 **Live Demo:** [https://research-assistant-agent-ten.vercel.app/](https://research-assistant-agent-ten.vercel.app/)
+
 A multi-turn AI research agent built with **LangGraph**, **Google Gemini**, and **Tavily Search**. The agent decomposes research topics into sub-questions, retrieves information from multiple tools, evaluates its own output quality, and delivers comprehensive, cited answers.
 
 ---
