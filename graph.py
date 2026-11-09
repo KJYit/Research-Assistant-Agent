@@ -10,6 +10,7 @@ from langgraph.graph import END, START, StateGraph
 
 from nodes import research_turn as stages
 from state import SessionState, TurnState
+from tools.research_budget import ResearchDeadlineExceeded, remaining_seconds, research_budget, within_budget
 from tools.research_providers import ResearchProviders, default_providers
 from tools.retrieval import SemanticIndex
 
@@ -47,6 +48,8 @@ def build_graph(providers: ResearchProviders | None = None):
         topic = state["topic"]
         history = state.get("messages", [])
         result = turn.invoke({"topic": topic, "history": history[-4:]})
+        if remaining_seconds() == 0:
+            raise ResearchDeadlineExceeded("Research deadline exceeded")
         answer = result["final_answer"]
         return {
             "messages": history + [HumanMessage(content=topic), AIMessage(content=answer)],
@@ -67,7 +70,8 @@ _thread_locks: WeakValueDictionary[str, Lock] = WeakValueDictionary()
 _registry_lock = Lock()
 
 
-def invoke_research_turn(topic: str, thread_id: str, *, graph=None) -> SessionState:
+def invoke_research_turn(topic: str, thread_id: str, *, graph=None,
+                         timeout_seconds: float | None = None) -> SessionState:
     """Run a turn using a process-local lock for each active conversation."""
     with _registry_lock:
         lock = _thread_locks.get(thread_id)
@@ -75,5 +79,5 @@ def invoke_research_turn(topic: str, thread_id: str, *, graph=None) -> SessionSt
             lock = _thread_locks[thread_id] = Lock()
     if graph is None:
         graph = research_graph
-    with lock:
+    with research_budget(timeout_seconds), within_budget(lock):
         return graph.invoke({"topic": topic}, config={"configurable": {"thread_id": thread_id}})

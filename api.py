@@ -21,15 +21,19 @@ if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 import logging
+import os
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from graph import invoke_research_turn
+from tools.rate_limit import enforce_research_limit
+from tools.research_budget import ResearchDeadlineExceeded
 
 logger = logging.getLogger("uvicorn.error.research")
+_RESEARCH_TIMEOUT_SECONDS = 75
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -43,10 +47,16 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "https://research-assistant-agent-ten.vercel.app"],
+    allow_origins=[
+        "http://localhost:5173",
+        "https://research-assistant-agent-ten.vercel.app",
+        *[origin.strip().rstrip("/") for origin in os.getenv("RESEARCH_ALLOWED_ORIGINS", "").split(",")
+          if origin.strip().rstrip("/")],
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Retry-After"],
 )
 
 
@@ -80,7 +90,7 @@ def health():
 
 
 @app.post("/api/research", response_model=ResearchResponse)
-def research(req: ResearchRequest):
+def research(req: ResearchRequest, request: Request):
     """
     Execute one research turn for the given topic and thread.
 
@@ -90,8 +100,12 @@ def research(req: ResearchRequest):
     if not req.topic.strip():
         raise HTTPException(status_code=400, detail="Topic must not be empty.")
 
+    enforce_research_limit(request)
     try:
-        final_state = invoke_research_turn(req.topic, req.thread_id)
+        final_state = invoke_research_turn(req.topic, req.thread_id, timeout_seconds=_RESEARCH_TIMEOUT_SECONDS)
+    except ResearchDeadlineExceeded as exc:
+        logger.info("research_turn_failed reason=deadline_exceeded")
+        raise HTTPException(504, "The research request timed out. Please retry with a narrower question.") from exc
     except Exception as exc:
         logger.error("research_turn_failed reason=%s", type(exc).__name__)
         raise HTTPException(

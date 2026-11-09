@@ -50,6 +50,22 @@ npm run dev
 
 Open [the local web UI](http://localhost:5173). Send `POST /api/research` requests with `topic` and `thread_id` to receive `answer`, `sources`, and `thread_id`. Reuse the thread ID for follow-ups within the same API process.
 
+## Deploy a Vercel preview
+
+1. Import the repo into a FastAPI project with the repository root as its root directory. The Vercel configuration points to `api:app` and gives the function 90 seconds on Fluid compute. Set `GOOGLE_API_KEY` and `TAVILY_API_KEY` on this backend project.
+2. Use `frontend` as the root directory of the Vite project. Set its `VITE_API_URL` to the deployed API origin. Add the frontend preview or production origin to `RESEARCH_ALLOWED_ORIGINS` on the backend, using a comma-separated list for multiple origins.
+3. Protect `POST /api/research` with a fixed window of five requests per IP per 60 seconds. On the backend project, configure this as a [Vercel Firewall rule](https://vercel.com/docs/vercel-firewall/vercel-waf/rate-limiting) with a `429` action. For API-generated `429` responses that include CORS and `Retry-After`, set `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` on the backend to use the built-in shared counter. Use one limiter for this endpoint.
+
+The API gives each research turn a 75-second budget and reserves time for a response. It can skip an evidence retry when time is short and use the evidence already gathered. Chat history is temporary and tied to the backend instance.
+
+Start with a fresh rate-limit window. Check the preview with a new question, a follow-up, and a small concurrent batch. The probe uses three simultaneous requests by default and reports timings, HTTP errors, rate limits, and whether each answer contains valid citation numbers. Its p95 describes this small sample. Check the backend logs for provider fallbacks and review the generated answers separately.
+
+```bash
+python -m evaluation.api_check https://your-api.vercel.app
+```
+
+If an answer lists sources but says Gemini reached its rate limit, search the backend's Vercel runtime logs for `research_provider_failed=gemini stage=respond reason=http_429`. Check the model's request and token limits for the backend key's project in Google AI Studio. Retry after the quota window resets. Keys from the same Gemini project share its limits. A log with `research_fallback=answer_failed reason=invalid_citations` means the model returned an answer whose citations failed validation.
+
 ## Run the notebook
 
 From the repository root, install Jupyter in the same environment as the backend and open the notebook.

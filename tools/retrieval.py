@@ -7,6 +7,7 @@ from collections.abc import Callable
 from threading import Lock
 from urllib.parse import urlsplit, urlunsplit
 
+from .research_budget import within_budget
 from .research_providers import Candidate
 
 
@@ -196,7 +197,7 @@ class SemanticIndex:
         self._lock = Lock()
 
     def retrieve(self, queries: list[str], top_k: int = 5) -> list[list[Candidate]]:
-        with self._lock:
+        with within_budget(self._lock):
             if self._document_vectors is None:
                 texts = [f"{doc['title']}\n{doc['content']}" for doc in DOCUMENTS]
                 self._document_vectors = _unit_vectors(self._embed_documents(texts), len(texts))

@@ -6,14 +6,16 @@ import unittest
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
-from httpx import ReadTimeout
+from google.genai.errors import ClientError
+from httpx import ReadTimeout, Request, Response
 from langchain_core.messages import AIMessage, HumanMessage
 
 import api
 import main
 from evaluation.retrieval_benchmark import score
 from graph import build_graph, build_turn_graph, invoke_research_turn
-from tools.research_providers import Judgment, QueryPlan, ResearchProviders, default_providers
+from tools.research_budget import ResearchDeadlineExceeded, remaining_seconds
+from tools.research_providers import Judgment, QueryPlan, ResearchProviders, _gemini_call, default_providers
 from tools.retrieval import retrieve_lexical
 
 
@@ -252,9 +254,30 @@ class ResearchTurnTests(unittest.TestCase):
 
     def test_answer_citations_cannot_reference_unselected_evidence(self):
         turn = build_turn_graph(_providers(answer=lambda *args: "Valid [1] and invalid [99]."))
-        result = turn.invoke({"topic": "BM25 dense passage retrieval"})
+        with self.assertLogs("uvicorn.error.research", level="INFO") as logs:
+            result = turn.invoke({"topic": "BM25 dense passage retrieval"})
         self.assertNotIn("[99]", result["final_answer"])
         self.assertEqual(result["sources"], [candidate["url"] for candidate in result["selected_candidates"]])
+        self.assertIn("research_fallback=answer_failed reason=invalid_citations", "\n".join(logs.output))
+
+    def test_answer_rate_limit_keeps_sources_without_retrying_gemini(self):
+        def wrapped_quota_error():
+            try:
+                raise ClientError(429, {"error": {"status": "RESOURCE_EXHAUSTED", "message": "private detail"}})
+            except ClientError as exc:
+                raise RuntimeError("wrapped provider error") from exc
+
+        model_call = Mock(side_effect=wrapped_quota_error)
+        turn = build_turn_graph(_providers(answer=lambda *args: _gemini_call("respond", model_call)))
+        with self.assertLogs("uvicorn.error.research", level="INFO") as logs:
+            result = turn.invoke({"topic": "BM25 dense passage retrieval"})
+
+        model_call.assert_called_once_with()
+        self.assertIn("Gemini reached its rate limit", result["final_answer"])
+        self.assertTrue(result["sources"])
+        messages = "\n".join(logs.output)
+        self.assertIn("research_provider_failed=gemini stage=respond reason=http_429", messages)
+        self.assertNotIn("private detail", messages)
 
     def test_coverage_uses_only_snippets_selected_for_the_answer(self):
         def prepare(topic, history, missing):
@@ -326,7 +349,8 @@ class ResearchSessionTests(unittest.TestCase):
         self.assertTrue(second_entered.is_set())
 
     def test_api_contract_and_empty_topic(self):
-        with patch("graph.research_graph", build_graph(_providers())), TestClient(api.app) as client:
+        with (patch("api.enforce_research_limit"),
+              patch("graph.research_graph", build_graph(_providers())), TestClient(api.app) as client):
             response = client.post("/api/research", json={"topic": "BM25 retrieval", "thread_id": "api-test"})
             self.assertEqual(response.status_code, 200)
             self.assertEqual(set(response.json()), {"answer", "sources", "thread_id"})
@@ -334,6 +358,82 @@ class ResearchSessionTests(unittest.TestCase):
             self.assertEqual(response.json()["answer"], "Supported by the source [1].")
             empty = client.post("/api/research", json={"topic": "  ", "thread_id": "api-test"})
             self.assertEqual(empty.status_code, 400)
+
+    def test_short_budget_reaches_graph_and_skips_an_evidence_retry(self):
+        calls = []
+        web_budgets = []
+
+        def prepare(topic, history, missing):
+            calls.append(remaining_seconds())
+            return QueryPlan(standalone_question=topic, queries=[topic, "extra detail"])
+
+        def rerank(question, queries, candidates):
+            return [Judgment(candidate_id=item["id"], relevance=3, covered_query_ids=[1])
+                    for item in candidates]
+
+        def web_search(query):
+            web_budgets.append(remaining_seconds())
+            return []
+
+        graph = build_graph(_providers(prepare=prepare, rerank=rerank, web_search=web_search))
+        result = invoke_research_turn("BM25 retrieval", "short", graph=graph, timeout_seconds=25)
+        self.assertEqual(len(calls), 1)
+        self.assertLessEqual(calls[0], 25)
+        self.assertEqual(len(web_budgets), 2)
+        self.assertTrue(all(0 < budget <= 25 for budget in web_budgets))
+        self.assertIn("Evidence is still missing", result["final_answer"])
+        self.assertTrue(result["sources"])
+
+    def test_expired_turn_does_not_append_to_session(self):
+        clock = [0.0]
+
+        def prepare(topic, history, missing):
+            if topic == "expired":
+                clock[0] = 76
+            return _prepare(topic, history, missing)
+
+        graph = build_graph(_providers(prepare=prepare))
+        invoke_research_turn("BM25 retrieval", "timeout", graph=graph)
+        with patch("tools.research_budget.monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaises(ResearchDeadlineExceeded):
+                invoke_research_turn("expired", "timeout", graph=graph, timeout_seconds=75)
+
+        state = graph.get_state({"configurable": {"thread_id": "timeout"}}).values
+        self.assertEqual(len(state["messages"]), 2)
+        self.assertEqual(state["messages"][0].content, "BM25 retrieval")
+
+    def test_api_returns_504_for_an_expired_turn(self):
+        with (patch("api.enforce_research_limit"),
+              patch("api.invoke_research_turn", side_effect=ResearchDeadlineExceeded) as invoke,
+              TestClient(api.app) as client):
+            response = client.post("/api/research", json={"topic": "BM25", "thread_id": "timeout"})
+        self.assertEqual(response.status_code, 504)
+        invoke.assert_called_once_with("BM25", "timeout", timeout_seconds=75)
+
+    def test_shared_rate_limit_rejects_request_before_running_graph(self):
+        settings = {
+            "UPSTASH_REDIS_REST_URL": "https://redis.example.test",
+            "UPSTASH_REDIS_REST_TOKEN": "offline-test",
+            "VERCEL": "1",
+        }
+        redis_request = Request("POST", settings["UPSTASH_REDIS_REST_URL"])
+        redis_replies = [Response(200, json={"result": [count, 27]}, request=redis_request)
+                         for count in (5, 6)]
+        with (patch.dict("os.environ", settings),
+              patch("tools.rate_limit.httpx.post", side_effect=redis_replies) as store,
+              patch("api.invoke_research_turn", return_value={"final_answer": "Evidence [1]", "sources": ["example"]}) as invoke,
+              TestClient(api.app) as client):
+            data = {"topic": "BM25", "thread_id": "limited"}
+            headers = {"Origin": "http://localhost:5173", "x-vercel-forwarded-for": "192.0.2.1"}
+            allowed = client.post("/api/research", json=data, headers=headers)
+            response = client.post("/api/research", json=data, headers=headers)
+
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.headers["Retry-After"], "27")
+        self.assertEqual(response.headers["access-control-allow-origin"], "http://localhost:5173")
+        self.assertNotIn("192.0.2.1", store.call_args.kwargs["json"][3])
+        invoke.assert_called_once()
 
     def test_cli_entry_point(self):
         with (patch("graph.research_graph", build_graph(_providers())),

@@ -1,9 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import ReactMarkdown from 'react-markdown';
-import { Send, RefreshCw, Microscope, ExternalLink, Brain } from 'lucide-react';
-import './index.css';
-
-// ── Types ─────────────────────────────────────────────────────────────────────
+import {
+  ArrowUpRight, BookOpen, ChevronDown, CircleAlert, GitBranch, Layers3, LibraryBig, Moon, Network, Plus, Sun, ThumbsUp,
+} from 'lucide-react';
+import Composer from './Composer';
+import InkAnswer from './InkAnswer';
 
 interface ChatMessage {
   id: string;
@@ -12,134 +12,114 @@ interface ChatMessage {
   sources?: string[];
 }
 
-interface LoadingStage {
-  id: string;
-  label: string;
-  icon: string;
-  status: 'pending' | 'active' | 'done';
-}
-
-const STAGES: Omit<LoadingStage, 'status'>[] = [
-  { id: 'prepare',  label: 'Preparing search queries',         icon: '⬡' },
-  { id: 'retrieve', label: 'Searching the knowledge base and web', icon: '◎' },
-  { id: 'rerank',   label: 'Ranking the evidence',              icon: '◈' },
-  { id: 'coverage', label: 'Checking evidence coverage',        icon: '◇' },
-  { id: 'respond',  label: 'Generating a cited answer',         icon: '◉' },
-];
-
 const SUGGESTIONS = [
-  { icon: '🧬', text: 'How does retrieval-augmented generation work?' },
-  { icon: '🤖', text: 'What are the key differences between GPT-4 and Gemini?' },
-  { icon: '⚡', text: 'Explain transformer architecture in deep learning' },
-  { icon: '🔍', text: 'What frameworks are used to build AI agents?' },
+  { icon: LibraryBig, text: 'How does retrieval-augmented generation work?' },
+  { icon: GitBranch, text: 'What are the key differences between GPT-4 and Gemini?' },
+  { icon: Layers3, text: 'Explain transformer architecture in deep learning' },
+  { icon: Network, text: 'What frameworks are used to build AI agents?' },
 ];
 
 const LOCAL_API_BASE = 'http://localhost:8000';
 const API_BASE = import.meta.env.VITE_API_URL?.trim().replace(/\/+$/, '') || LOCAL_API_BASE;
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 function generateId(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
-
-
-// ── Loading Indicator ─────────────────────────────────────────────────────────
-
 function LoadingIndicator() {
-  const [stageIndex, setStageIndex] = useState(0);
-
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setStageIndex(prev => Math.min(prev + 1, STAGES.length - 1));
-    }, 3500);
-    return () => clearInterval(timer);
-  }, []);
-
   return (
-    <div className="loading-card">
-      <div className="loading-stages">
-        {STAGES.map((stage, idx) => {
-          const status =
-            idx < stageIndex ? 'done' :
-            idx === stageIndex ? 'active' : 'pending';
-          return (
-            <div key={stage.id} className={`loading-stage ${status}`}>
-              <span className="stage-icon">{status === 'done' ? '✓' : stage.icon}</span>
-              <span>{stage.label}</span>
-            </div>
-          );
-        })}
-      </div>
+    <div className="loading-card" role="status">
+      <span className="loading-ink" aria-hidden="true" />
+      <span>Working on your answer…</span>
     </div>
   );
 }
 
-// ── Answer Card ───────────────────────────────────────────────────────────────
+function AnswerCard({ id, content, sources, latest, answerRef }: {
+  id: string;
+  content: string;
+  sources?: string[];
+  latest: boolean;
+  answerRef: React.RefObject<HTMLElement | null>;
+}) {
+  const [expanded, setExpanded] = useState(true);
+  const [liked, setLiked] = useState(false);
+  const sourcesId = `sources-${id}`;
 
-function AnswerCard({ content, sources }: { content: string; sources?: string[] }) {
   return (
-    <div className="answer-card">
-      <div className="answer-header">
-        <span className="answer-icon"><Brain size={13} /></span>
-        <span className="answer-label">Research Answer</span>
-      </div>
-      <div className="answer-body">
-        <ReactMarkdown disallowedElements={['a', 'img']} unwrapDisallowed>
-          {content}
-        </ReactMarkdown>
-        {sources && sources.length > 0 && (
-          <div className="sources-section">
-            <div className="sources-title">Sources</div>
-            <div className="source-list">
-              {sources.map((url, i) => (
-                <div key={i} className="source-item">
-                  <span className="source-num">[{i + 1}]</span>
-                  <a href={url} target="_blank" rel="noopener noreferrer" title={url}>
-                    {url.replace(/^https?:\/\//, '').slice(0, 60)}{url.length > 65 ? '…' : ''}
-                  </a>
-                  <ExternalLink size={11} style={{ opacity: 0.4, flexShrink: 0 }} />
-                </div>
-              ))}
-            </div>
-          </div>
+    <article className="answer-card" ref={latest ? answerRef : undefined}>
+      <InkAnswer content={content} animate={latest} />
+      <footer className="answer-tools">
+        {!!sources?.length && (
+          <h3 className="sources-title">
+            <button type="button" className="sources-toggle" aria-expanded={expanded} aria-controls={sourcesId}
+              onClick={() => setExpanded(open => !open)}>
+              Sources <span className="source-count">{String(sources.length).padStart(2, '0')}</span>
+              <ChevronDown size={16} aria-hidden="true" />
+            </button>
+          </h3>
         )}
-      </div>
-    </div>
+        <button type="button" className="like-button" aria-label="Like answer" aria-pressed={liked}
+          title="Like answer" onClick={() => setLiked(value => !value)}>
+          <ThumbsUp size={18} aria-hidden="true" />
+        </button>
+      </footer>
+      {!!sources?.length && (
+        <div id={sourcesId} className="sources-panel" data-expanded={expanded} inert={!expanded}>
+          <div className="sources-inner">
+            <ol className="source-list" role="list">
+              {sources.map((url, index) => (
+                <li key={index} className="source-item">
+                  <span className="source-num">[{index + 1}]</span>
+                  {/^https?:\/\//i.test(url) ? (
+                    <a href={url} target="_blank" rel="noopener noreferrer" title={url}>
+                      {url.replace(/^https?:\/\//i, '')}
+                      <ArrowUpRight size={14} aria-hidden="true" />
+                    </a>
+                  ) : (
+                    <span className="local-source" title={url}>{url}</span>
+                  )}
+                </li>
+              ))}
+            </ol>
+          </div>
+        </div>
+      )}
+    </article>
   );
 }
-
-// ── Main App ──────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [sessionId, setSessionId] = useState<string>(() => generateId() + generateId());
+  const [sessionId, setSessionId] = useState(() => generateId() + generateId());
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
+  const [dark, setDark] = useState(() => localStorage.getItem('research-theme') === 'dark');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const answerRef = useRef<HTMLElement>(null);
+  const lastMessage = messages.at(-1);
 
-  // Auto-scroll to bottom when messages change
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, loading]);
-
-  // Auto-resize textarea
-  useEffect(() => {
-    const ta = textareaRef.current;
-    if (ta) {
-      ta.style.height = 'auto';
-      ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+    if (messages.length === 0) return;
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const behavior = reduceMotion ? 'auto' : 'smooth';
+    if (lastMessage?.type === 'answer') {
+      answerRef.current?.scrollIntoView({ block: 'start', behavior });
+    } else {
+      bottomRef.current?.scrollIntoView({ block: 'nearest', behavior });
     }
-  }, [input]);
+  }, [lastMessage, loading, messages.length]);
+
+  useEffect(() => {
+    localStorage.setItem('research-theme', dark ? 'dark' : 'light');
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  }, [dark]);
 
   const startNewSession = useCallback(() => {
     setSessionId(generateId() + generateId());
     setMessages([]);
-    setError(null);
+    setInput('');
     textareaRef.current?.focus();
   }, []);
 
@@ -147,11 +127,9 @@ export default function App() {
     const trimmed = topic.trim();
     if (!trimmed || loading) return;
 
-    const queryId = generateId();
-    setMessages(prev => [...prev, { id: queryId, type: 'query', content: trimmed }]);
+    setMessages(prev => [...prev, { id: generateId(), type: 'query', content: trimmed }]);
     setInput('');
     setLoading(true);
-    setError(null);
 
     try {
       const res = await fetch(`${API_BASE}/api/research`, {
@@ -166,6 +144,14 @@ export default function App() {
         throw new Error(`Could not reach the Research API at ${API_BASE}. ${guidance}`, { cause });
       });
 
+      if (res.status === 429) {
+        const retryAfter = Number(res.headers.get('Retry-After'));
+        const wait = retryAfter > 0 ? `in ${retryAfter} seconds` : 'in a moment';
+        throw new Error(`Too many research requests. Try again ${wait}.`);
+      }
+      if (res.status === 504) {
+        throw new Error('The research request timed out. Try again with a narrower question.');
+      }
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         throw new Error(errData.detail ?? `Server error ${res.status}`);
@@ -178,146 +164,83 @@ export default function App() {
       ]);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Unknown error';
-      setMessages(prev => [
-        ...prev,
-        { id: generateId(), type: 'error', content: msg },
-      ]);
+      setMessages(prev => [...prev, { id: generateId(), type: 'error', content: msg }]);
     } finally {
       setLoading(false);
     }
   }, [loading, sessionId]);
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      submit(input);
-    }
-  };
-
   return (
     <div className="app-wrapper">
-      {/* ── Header ── */}
       <header className="header">
         <div className="header-inner">
           <div className="logo">
-            <div className="logo-icon"><Microscope size={17} /></div>
+            <span className="logo-icon"><BookOpen size={20} aria-hidden="true" /></span>
             <span className="logo-text">Research Agent</span>
           </div>
+          <button type="button" className="theme-button" aria-label={dark ? 'Light mode' : 'Dark mode'}
+            onClick={() => setDark(value => !value)}>
+            {dark ? <Sun size={17} aria-hidden="true" /> : <Moon size={17} aria-hidden="true" />}
+            <span>{dark ? 'Light' : 'Dark'}</span>
+          </button>
         </div>
       </header>
 
-      {/* ── Main ── */}
       <main className="main">
-        {/* Hero */}
         <section className="hero">
-          <h1 className="hero-title">AI-Powered <span className="highlight">Research Assistant</span></h1>
+          <p className="eyebrow">The research desk</p>
+          <h1 className="hero-title"><span>Research</span>{' '}<em>Assistant</em></h1>
           <p className="hero-subtitle">
-            Ask any question. The agent decomposes it into sub-questions, searches the web,
-            retrieves knowledge, and delivers a comprehensive cited answer.
+            Ask a question, explore the evidence, and read the sources behind each answer.
           </p>
         </section>
 
-        {/* Session indicator */}
         <div className="session-card">
-          <div className="session-info">
-            <span className="session-dot" />
-            <span>Session active</span>
-          </div>
-          <button
-            id="btn-new-session"
-            className="btn-new-session"
-            onClick={startNewSession}
-            title="Start a fresh research session"
-          >
-            <RefreshCw size={12} /> New Session
+          <span className="session-info"><span className="session-dot" aria-hidden="true" /> Session active</span>
+          <button type="button" id="btn-new-session" className="btn-new-session"
+            onClick={startNewSession} disabled={loading}>
+            <Plus size={16} aria-hidden="true" /> New session
           </button>
         </div>
 
-        {/* Error banner */}
-        {error && (
-          <div className="error-banner" role="alert">
-            ⚠ {error}
-          </div>
-        )}
-
-        {/* Chat history */}
-        {messages.length === 0 && !loading ? (
-          <div className="empty-state">
+        <span className="sr-only" aria-live="polite">
+          {lastMessage?.type === 'answer' ? 'Research answer ready.' : ''}
+        </span>
+        {messages.length === 0 ? (
+          <section className="empty-state" aria-labelledby="suggestions-title">
+            <h2 className="eyebrow" id="suggestions-title">Start with a question</h2>
             <div className="suggestions-grid">
-              {SUGGESTIONS.map((s, i) => (
-                <button
-                  key={i}
-                  id={`suggestion-${i}`}
-                  className="suggestion-card"
-                  onClick={() => submit(s.text)}
-                >
-                  <span className="suggestion-icon">{s.icon}</span>
-                  <span className="suggestion-text">{s.text}</span>
+              {SUGGESTIONS.map(({ icon: Icon, text }, index) => (
+                <button type="button" key={text} id={`suggestion-${index}`}
+                  className="suggestion-card" onClick={() => submit(text)}>
+                  <span className="suggestion-meta" aria-hidden="true">
+                    <Icon size={19} /> <span>{String(index + 1).padStart(2, '0')}</span>
+                  </span>
+                  <span className="suggestion-text">{text}</span>
                 </button>
               ))}
             </div>
-          </div>
+          </section>
         ) : (
-          <div className="chat-history">
-            {messages.map(msg => {
-              if (msg.type === 'query') {
-                return (
-                  <div key={msg.id} className="query-bubble">
-                    {msg.content}
-                  </div>
-                );
+          <section className="chat-history" aria-label="Research conversation">
+            {messages.map(message => {
+              if (message.type === 'answer') {
+                return <AnswerCard key={message.id} id={message.id} content={message.content}
+                  sources={message.sources} latest={message === lastMessage} answerRef={answerRef} />;
               }
-              if (msg.type === 'answer') {
-                return (
-                  <AnswerCard key={msg.id} content={msg.content} sources={msg.sources} />
-                );
+              if (message.type === 'error') {
+                return <div key={message.id} className="error-banner" role="alert">
+                  <CircleAlert size={19} aria-hidden="true" /> {message.content}
+                </div>;
               }
-              if (msg.type === 'error') {
-                return (
-                  <div key={msg.id} className="error-banner" role="alert">
-                    ⚠ {msg.content}
-                  </div>
-                );
-              }
-              return null;
+              return <div key={message.id} className="query-bubble">{message.content}</div>;
             })}
             {loading && <LoadingIndicator />}
-          </div>
+          </section>
         )}
-
-        {/* Bottom anchor for auto-scroll */}
-        <div ref={bottomRef} />
-
-        {/* Input area */}
-        <div className="input-area">
-          <form
-            className="input-form"
-            onSubmit={e => { e.preventDefault(); submit(input); }}
-          >
-            <div className="input-wrapper">
-              <textarea
-                ref={textareaRef}
-                id="research-input"
-                className="input-field"
-                placeholder="Ask a research question… (Enter to send, Shift+Enter for newline)"
-                value={input}
-                onChange={e => setInput(e.target.value)}
-                onKeyDown={handleKeyDown}
-                disabled={loading}
-                rows={1}
-              />
-            </div>
-            <button
-              id="btn-submit"
-              type="submit"
-              className="btn-submit"
-              disabled={loading || !input.trim()}
-              title="Send"
-            >
-              <Send size={18} />
-            </button>
-          </form>
-        </div>
+        <div className="scroll-anchor" ref={bottomRef} />
+        <Composer value={input} loading={loading} onChange={setInput}
+          onSubmit={() => submit(input)} textareaRef={textareaRef} />
       </main>
     </div>
   );

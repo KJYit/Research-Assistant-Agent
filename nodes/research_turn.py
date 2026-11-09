@@ -5,13 +5,15 @@ import re
 from time import perf_counter
 
 from state import TurnState
-from tools.research_providers import Judgment, QueryPlan, RerankOutputError
+from tools.research_budget import ResearchDeadlineExceeded, remaining_seconds
+from tools.research_providers import GeminiRateLimitExceeded, Judgment, QueryPlan, RerankOutputError
 from tools.retrieval import SemanticIndex, fuse_ranked, retrieve_lexical, web_candidates
 
 
 logger = logging.getLogger("uvicorn.error.research")
 _MAX_QUERY_LENGTH = 400
 _MAX_RETRIES = 1
+_MIN_RESEARCH_RETRY_SECONDS = 50
 _CITATION = re.compile(r"\[(\s*\d[\d\s,;–—-]*)\]")
 
 
@@ -195,7 +197,8 @@ def check_coverage(state: TurnState) -> TurnState:
 
 
 def after_coverage(state: TurnState) -> str:
-    if state["missing_query_ids"] and state["retries"] < _MAX_RETRIES:
+    if (state["missing_query_ids"] and state["retries"] < _MAX_RETRIES
+            and remaining_seconds() >= _MIN_RESEARCH_RETRY_SECONDS):
         return "prepare_queries"
     return "respond"
 
@@ -212,19 +215,30 @@ def respond(state: TurnState, answer) -> TurnState:
     uncertain = state["coverage"] == "uncertain"
     answer_gaps = gaps + (["The relevance and coverage of the available evidence are uncertain."]
                           if uncertain else [])
-    fallbacks = []
+    final_answer = "I found the sources below, but couldn't produce a cited answer from them."
+    failure = None
     try:
-        final_answer = answer(state["standalone_question"], snippets, answer_gaps).strip()
-        valid = {str(index) for index in range(1, len(snippets) + 1)}
-        cited = _CITATION.findall(final_answer)
-        if not cited or any(number.strip() not in valid for number in cited):
-            raise ValueError("Answer did not use valid source citations")
-        if re.search(r"\[\s*\d+\s*\][(\[]|(?m:^\s*\[\d+\]:)", final_answer):
-            raise ValueError("Answer tried to redefine a numbered citation")
+        draft = answer(state["standalone_question"], snippets, answer_gaps).strip()
+    except GeminiRateLimitExceeded:
+        failure = "http_429"
+        final_answer = "I found the sources below, but Gemini reached its rate limit. Please try again later."
+    except ResearchDeadlineExceeded:
+        failure = "deadline_exceeded"
+        final_answer = "I found the sources below, but ran out of time to write a cited answer."
     except Exception as exc:
-        logger.info("research_fallback=answer_failed reason=%s", type(exc).__name__)
-        final_answer = "I found the sources below, but couldn't produce a cited answer from them."
-        fallbacks.append("answer_failed")
+        failure = type(exc).__name__
+    else:
+        valid = {str(index) for index in range(1, len(snippets) + 1)}
+        cited = _CITATION.findall(draft)
+        if not cited or any(number.strip() not in valid for number in cited):
+            failure = "invalid_citations"
+        elif re.search(r"\[\s*\d+\s*\][(\[]|(?m:^\s*\[\d+\]:)", draft):
+            failure = "invalid_citations"
+        else:
+            final_answer = draft
+
+    if failure:
+        logger.info("research_fallback=answer_failed reason=%s", failure)
 
     if uncertain:
         final_answer += "\n\nI couldn't verify how fully these sources cover the question."
@@ -234,4 +248,4 @@ def respond(state: TurnState, answer) -> TurnState:
         final_answer += "\n".join(f"- {gap}" for gap in escaped)
     _log("respond", started, sources=len(snippets))
     return {"final_answer": final_answer, "sources": [item["url"] for item in snippets],
-            "fallbacks": fallbacks}
+            "fallbacks": ["answer_failed"] if failure else []}
