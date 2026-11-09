@@ -1,86 +1,17 @@
-"""
-tools/search_tools.py — Tool definitions for the Research Assistant Agent.
+"""Bundled research corpus and ranking functions."""
 
-Two tools are registered:
-  1. tavily_search   — live web search via Tavily API (LangChain-native)
-  2. vector_retrieve — keyword-ranked retrieval from an in-memory document store
-
-Both return a list[dict] with uniform keys: query, content, url.
-This consistency means downstream nodes never need to branch on tool type.
-"""
-
-import os
 import math
 import re
-from collections import Counter
-from typing import Any
+from collections import Counter, defaultdict
+from collections.abc import Callable
+from threading import Lock
+from urllib.parse import urlsplit, urlunsplit
 
-from langchain_community.tools.tavily_search import TavilySearchResults
-
-
-# ── Tool 1: Tavily Web Search ────────────────────────────────────────────────
-
-def get_tavily_tool(max_results: int = 4) -> TavilySearchResults:
-    """
-    Returns a configured TavilySearchResults tool instance.
-
-    Tavily is preferred over DuckDuckGo for LangGraph agents because it
-    returns structured JSON (title, url, content) instead of raw HTML,
-    which eliminates a parsing step.
-
-    Requires TAVILY_API_KEY in environment.
-    """
-    return TavilySearchResults(
-        max_results=max_results,
-        search_depth="advanced",       # deeper crawl for research tasks
-        include_answer=True,           # include Tavily's own summary
-        include_raw_content=False,     # raw HTML not needed; saves tokens
-    )
+from .research_budget import within_budget
+from .research_providers import Candidate
 
 
-def run_tavily_search(query: str, max_results: int = 4) -> list[dict]:
-    """
-    Execute a single Tavily search and normalise results.
-
-    Parameters
-    ----------
-    query       : the search string
-    max_results : max number of results to return
-
-    Returns
-    -------
-    list of dicts with keys: query, content, url
-    Empty list on any failure (caller handles the empty-result case).
-    """
-    try:
-        tool = get_tavily_tool(max_results)
-        raw = tool.invoke({"query": query})
-
-        results = []
-        for item in raw:
-            results.append({
-                "query":   query,
-                "content": item.get("content", ""),
-                "url":     item.get("url", "No URL"),
-                "title":   item.get("title", ""),
-            })
-        return results
-
-    except Exception as exc:
-        # Surface the error string so the error-handler node can log it
-        print(f"[Tavily] Search failed for '{query}': {exc}")
-        return []
-
-
-# ── Tool 2: In-Memory Vector Store (TF-IDF keyword retriever) ───────────────
-# Design decision: using a hand-rolled TF-IDF retriever instead of FAISS/
-# Chroma keeps the project dependency-light and avoids the need for an
-# embeddings API key. For production use, swap _score_doc for a real
-# similarity function.
-
-# Seed corpus — representative research documents baked in so the tool
-# works offline and provides meaningful results for common CS/AI topics.
-_DOCUMENT_STORE: list[dict] = [
+DOCUMENTS: list[Candidate] = [
     {
         "id": "doc_001",
         "title": "Introduction to Large Language Models",
@@ -224,46 +155,113 @@ def _score_doc(query_tokens: list[str], doc_tokens: list[str],
     """TF-IDF dot product between query and document."""
     tf = _tf(doc_tokens)
     score = 0.0
-    for w in set(query_tokens):
+    for w in sorted(set(query_tokens)):
         score += tf.get(w, 0.0) * _idf(w, corpus)
     return score
 
 
-def run_vector_retrieve(query: str, top_k: int = 3) -> list[dict]:
-    """
-    Retrieve the top-k documents from the in-memory store using TF-IDF.
+_CORPUS_TOKENS = [_tokenize(doc["content"] + " " + doc["title"]) for doc in DOCUMENTS]
 
-    Parameters
-    ----------
-    query : natural language search string
-    top_k : number of documents to return
 
-    Returns
-    -------
-    list of dicts with keys: query, content, url, title
-    Always returns at least an empty list (never raises).
-    """
-    try:
-        query_tokens = _tokenize(query)
-        corpus_tokens = [_tokenize(d["content"] + " " + d["title"]) for d in _DOCUMENT_STORE]
+def retrieve_lexical(query: str, top_k: int = 5) -> list[Candidate]:
+    """Rank the bundled corpus with the original TF-IDF scorer."""
+    tokens = _tokenize(query)
+    scored = [
+        (_score_doc(tokens, document_tokens, _CORPUS_TOKENS), doc)
+        for doc, document_tokens in zip(DOCUMENTS, _CORPUS_TOKENS)
+    ]
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [doc.copy() for score, doc in scored[:top_k] if score > 0]
 
-        scored = [
-            (_score_doc(query_tokens, doc_toks, corpus_tokens), doc)
-            for doc_toks, doc in zip(corpus_tokens, _DOCUMENT_STORE)
-        ]
-        scored.sort(key=lambda x: x[0], reverse=True)
 
+def _unit_vectors(vectors: list[list[float]], expected: int) -> list[list[float]]:
+    if len(vectors) != expected:
+        raise ValueError("Unexpected embedding count")
+    width = len(vectors[0])
+    normalized = []
+    for vector in vectors:
+        norm = math.hypot(*vector)
+        if len(vector) != width or not math.isfinite(norm) or norm == 0:
+            raise ValueError("Invalid embedding vector")
+        normalized.append([value / norm for value in vector])
+    return normalized
+
+
+class SemanticIndex:
+    """Cache immutable corpus vectors within a graph instance."""
+
+    def __init__(self, embed_documents: Callable, embed_queries: Callable) -> None:
+        self._embed_documents = embed_documents
+        self._embed_queries = embed_queries
+        self._document_vectors: list[list[float]] | None = None
+        self._lock = Lock()
+
+    def retrieve(self, queries: list[str], top_k: int = 5) -> list[list[Candidate]]:
+        with within_budget(self._lock):
+            if self._document_vectors is None:
+                texts = [f"{doc['title']}\n{doc['content']}" for doc in DOCUMENTS]
+                self._document_vectors = _unit_vectors(self._embed_documents(texts), len(texts))
+            documents = self._document_vectors
+
+        vectors = _unit_vectors(self._embed_queries(queries), len(queries))
+        if len(vectors[0]) != len(documents[0]):
+            raise ValueError("Query and document embedding dimensions differ")
         results = []
-        for score, doc in scored[:top_k]:
-            if score > 0:  # only include docs with non-zero relevance
-                results.append({
-                    "query":   query,
-                    "content": doc["content"],
-                    "url":     doc["url"],
-                    "title":   doc["title"],
-                })
+        for query in vectors:
+            scored = [
+                (sum(a * b for a, b in zip(query, document)), doc)
+                for document, doc in zip(documents, DOCUMENTS)
+            ]
+            scored.sort(key=lambda item: item[0], reverse=True)
+            results.append([doc.copy() for score, doc in scored[:top_k] if score > 0])
         return results
 
-    except Exception as exc:
-        print(f"[VectorStore] Retrieval failed for '{query}': {exc}")
-        return []
+
+def _normalize_url(url: str) -> str:
+    parsed = urlsplit(url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username is not None:
+        raise ValueError("Invalid web URL")
+    port = parsed.port
+    host = parsed.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    if port is not None and (parsed.scheme, port) not in {("http", 80), ("https", 443)}:
+        host = f"{host}:{port}"
+    return urlunsplit((parsed.scheme, host, parsed.path or "/", parsed.query, ""))
+
+
+def web_candidates(items: list[dict]) -> list[Candidate]:
+    candidates: list[Candidate] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url, title, content = item.get("url"), item.get("title"), item.get("content")
+        if not isinstance(url, str) or not isinstance(content, str) or not content.strip():
+            continue
+        try:
+            normalized = _normalize_url(url)
+        except ValueError:
+            continue
+        candidates.append({
+            "id": f"web:{normalized}", "url": normalized,
+            "title": title[:200] if isinstance(title, str) else "",
+            "content": content.strip()[:1000],
+        })
+    return candidates
+
+
+def fuse_ranked(ranked_lists: list[list[Candidate]], limit: int | None = 12) -> list[Candidate]:
+    """Merge rankings with RRF, counting a candidate at most once per list."""
+    candidates: dict[str, Candidate] = {}
+    scores: dict[str, float] = defaultdict(float)
+    for ranking in ranked_lists:
+        seen: set[str] = set()
+        for candidate in ranking:
+            key = candidate["url"] if candidate["id"].startswith("web:") else candidate["id"]
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.setdefault(key, candidate)
+            scores[key] += 1 / (60 + len(seen))
+    keys = sorted(scores, key=scores.__getitem__, reverse=True)
+    return [candidates[key] for key in keys[:limit]]

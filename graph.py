@@ -1,141 +1,83 @@
-"""
-graph.py — LangGraph StateGraph definition for the Research Assistant Agent.
+"""LangGraph construction for stateless research turns and checkpointed sessions."""
 
-Graph topology
---------------
+from functools import partial
+from threading import Lock
+from weakref import WeakValueDictionary
 
-    [START]
-       │
-       ▼
-   [planner]  ◄──────────────────────────────────────────────┐
-       │                                                      │
-       ▼                                                      │
-  [researcher]                                               │
-       │                                                      │
-       ├─── retry_count > 1 ──► [error_handler] ─► [responder] ─► [END]
-       │                                                      │
-       ▼                                                      │
-  [retriever]                                                │
-       │                                                      │
-       ▼                                                      │
-  [synthesizer]                                              │
-       │                                                      │
-       ├─── needs_more_research=True ─────────────────────────┘
-       │
-       ▼
-  [responder]
-       │
-       ▼
-    [END]
-
-Conditional edges
------------------
-1. after_researcher : checks retry_count → routes to error_handler or retriever
-2. after_synthesizer: checks needs_more_research → routes to planner or responder
-"""
-
-from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
 
-from state import ResearchState
-from nodes import (
-    planner_node,
-    researcher_node,
-    retriever_node,
-    synthesizer_node,
-    responder_node,
-    error_handler_node,
-)
+from nodes import research_turn as stages
+from state import SessionState, TurnState
+from tools.research_budget import ResearchDeadlineExceeded, remaining_seconds, research_budget, within_budget
+from tools.research_providers import ResearchProviders, default_providers
+from tools.retrieval import SemanticIndex
 
 
-# ── Conditional edge functions ───────────────────────────────────────────────
+def build_turn_graph(providers: ResearchProviders | None = None):
+    """Build the per-turn pipeline. Intermediate state has no checkpointer."""
+    providers = providers or default_providers()
+    index = SemanticIndex(providers.embed_documents, providers.embed_queries)
+    builder = StateGraph(TurnState)
+    builder.add_node("prepare_queries", partial(stages.prepare_queries, prepare=providers.prepare))
+    builder.add_node("retrieve_local", partial(stages.retrieve_local, index=index))
+    builder.add_node("retrieve_web", partial(stages.retrieve_web, web_search=providers.web_search))
+    builder.add_node("fuse_candidates", stages.fuse_candidates)
+    builder.add_node("rerank_candidates", partial(stages.rerank_candidates, rerank=providers.rerank))
+    builder.add_node("check_coverage", stages.check_coverage)
+    builder.add_node("respond", partial(stages.respond, answer=providers.answer))
 
-def route_after_researcher(state: ResearchState) -> str:
-    """
-    Route based on whether Tavily returned any results.
-
-    Threshold: if retry_count > 1, the search has failed twice — send to
-    error handler. Otherwise, continue to retriever.
-    """
-    retry_count = state.get("retry_count", 0)
-    if retry_count > 1:
-        print(f"[Router] retry_count={retry_count} > 1 -> routing to error_handler")
-        return "error_handler"
-    print(f"[Router] retry_count={retry_count} -> routing to retriever")
-    return "retriever"
-
-
-def route_after_synthesizer(state: ResearchState) -> str:
-    """
-    Route based on the Synthesizer's sufficiency judgment.
-
-    If needs_more_research is True AND we haven't exceeded the replan cap,
-    loop back to the Planner. Otherwise, proceed to the Responder.
-    """
-    needs_more = state.get("needs_more_research", False)
-    turn_count = state.get("turn_count", 0)
-
-    # turn_count is already incremented by the Planner, so cap at 3 total turns
-    if needs_more and turn_count < 3:
-        print(f"[Router] needs_more_research=True, turn={turn_count} -> re-planning")
-        return "planner"
-
-    print(f"[Router] needs_more_research={needs_more}, turn={turn_count} -> responder")
-    return "responder"
+    builder.add_edge(START, "prepare_queries")
+    builder.add_conditional_edges("prepare_queries", stages.after_prepare,
+                                  ["retrieve_local", "retrieve_web", "respond"])
+    builder.add_edge(["retrieve_local", "retrieve_web"], "fuse_candidates")
+    builder.add_edge("fuse_candidates", "rerank_candidates")
+    builder.add_edge("rerank_candidates", "check_coverage")
+    builder.add_conditional_edges("check_coverage", stages.after_coverage,
+                                  ["prepare_queries", "respond"])
+    builder.add_edge("respond", END)
+    return builder.compile(checkpointer=False)
 
 
-# ── Graph construction ───────────────────────────────────────────────────────
+def build_graph(providers: ResearchProviders | None = None):
+    """Checkpoint conversation and public results by thread ID."""
+    turn = build_turn_graph(providers)
 
-def build_graph() -> StateGraph:
-    """
-    Construct and compile the LangGraph StateGraph.
+    def research_turn(state: SessionState) -> SessionState:
+        topic = state["topic"]
+        history = state.get("messages", [])
+        result = turn.invoke({"topic": topic, "history": history[-4:]})
+        if remaining_seconds() == 0:
+            raise ResearchDeadlineExceeded("Research deadline exceeded")
+        answer = result["final_answer"]
+        return {
+            "messages": history + [HumanMessage(content=topic), AIMessage(content=answer)],
+            "final_answer": answer,
+            "sources": result["sources"],
+        }
 
-    MemorySaver is used as the checkpointer, enabling thread-level
-    multi-turn persistence. Each conversation thread is identified by a
-    thread_id passed at invocation time.
-    """
-    builder = StateGraph(ResearchState)
-
-    # Register nodes
-    builder.add_node("planner",       planner_node)
-    builder.add_node("researcher",    researcher_node)
-    builder.add_node("retriever",     retriever_node)
-    builder.add_node("synthesizer",   synthesizer_node)
-    builder.add_node("responder",     responder_node)
-    builder.add_node("error_handler", error_handler_node)
-
-    # Unconditional edges
-    builder.add_edge(START,          "planner")
-    builder.add_edge("planner",      "researcher")
-    builder.add_edge("retriever",    "synthesizer")
-    builder.add_edge("error_handler","responder")
-    builder.add_edge("responder",    END)
-
-    # Conditional edge 1: after researcher -> retriever OR error_handler
-    builder.add_conditional_edges(
-        "researcher",
-        route_after_researcher,
-        {
-            "retriever":     "retriever",
-            "error_handler": "error_handler",
-        },
-    )
-
-    # Conditional edge 2: after synthesizer -> responder OR planner (re-plan)
-    builder.add_conditional_edges(
-        "synthesizer",
-        route_after_synthesizer,
-        {
-            "responder": "responder",
-            "planner":   "planner",
-        },
-    )
-
-    # Compile with in-memory checkpointer for multi-turn session persistence
-    memory = MemorySaver()
-    graph = builder.compile(checkpointer=memory)
-    return graph
+    builder = StateGraph(SessionState)
+    builder.add_node("research_turn", research_turn)
+    builder.add_edge(START, "research_turn")
+    builder.add_edge("research_turn", END)
+    return builder.compile(checkpointer=MemorySaver())
 
 
-# Module-level compiled graph instance (imported by main.py and cli.py)
 research_graph = build_graph()
+
+_thread_locks: WeakValueDictionary[str, Lock] = WeakValueDictionary()
+_registry_lock = Lock()
+
+
+def invoke_research_turn(topic: str, thread_id: str, *, graph=None,
+                         timeout_seconds: float | None = None) -> SessionState:
+    """Run a turn using a process-local lock for each active conversation."""
+    with _registry_lock:
+        lock = _thread_locks.get(thread_id)
+        if lock is None:
+            lock = _thread_locks[thread_id] = Lock()
+    if graph is None:
+        graph = research_graph
+    with research_budget(timeout_seconds), within_budget(lock):
+        return graph.invoke({"topic": topic}, config={"configurable": {"thread_id": thread_id}})
