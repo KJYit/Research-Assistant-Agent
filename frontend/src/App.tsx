@@ -20,11 +20,11 @@ interface LoadingStage {
 }
 
 const STAGES: Omit<LoadingStage, 'status'>[] = [
-  { id: 'plan',      label: 'Decomposing into sub-questions',   icon: '⬡' },
-  { id: 'search',    label: 'Searching the web via Tavily',      icon: '◎' },
-  { id: 'retrieve',  label: 'Querying local knowledge base',     icon: '◈' },
-  { id: 'synthesize',label: 'Synthesizing & evaluating results', icon: '◇' },
-  { id: 'respond',   label: 'Generating cited answer',           icon: '◉' },
+  { id: 'prepare',  label: 'Preparing search queries',         icon: '⬡' },
+  { id: 'retrieve', label: 'Searching the knowledge base and web', icon: '◎' },
+  { id: 'rerank',   label: 'Ranking the evidence',              icon: '◈' },
+  { id: 'coverage', label: 'Checking evidence coverage',        icon: '◇' },
+  { id: 'respond',  label: 'Generating a cited answer',         icon: '◉' },
 ];
 
 const SUGGESTIONS = [
@@ -34,7 +34,8 @@ const SUGGESTIONS = [
   { icon: '🔍', text: 'What frameworks are used to build AI agents?' },
 ];
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const LOCAL_API_BASE = 'http://localhost:8000';
+const API_BASE = import.meta.env.VITE_API_URL?.trim().replace(/\/+$/, '') || LOCAL_API_BASE;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -85,7 +86,9 @@ function AnswerCard({ content, sources }: { content: string; sources?: string[] 
         <span className="answer-label">Research Answer</span>
       </div>
       <div className="answer-body">
-        <ReactMarkdown>{content}</ReactMarkdown>
+        <ReactMarkdown disallowedElements={['a', 'img']} unwrapDisallowed>
+          {content}
+        </ReactMarkdown>
         {sources && sources.length > 0 && (
           <div className="sources-section">
             <div className="sources-title">Sources</div>
@@ -155,6 +158,12 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ topic: trimmed, thread_id: sessionId }),
+      }).catch((cause: unknown) => {
+        if (!(cause instanceof TypeError)) throw cause;
+        const guidance = API_BASE === LOCAL_API_BASE
+          ? 'From the repository root, run python -m uvicorn api:app --port 8000 and retry.'
+          : 'Check that the backend is running and allows requests from this site.';
+        throw new Error(`Could not reach the Research API at ${API_BASE}. ${guidance}`, { cause });
       });
 
       if (!res.ok) {

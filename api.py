@@ -20,16 +20,16 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
-import os
+import logging
 from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from langchain_core.messages import HumanMessage
+from graph import invoke_research_turn
 
-from graph import research_graph
+logger = logging.getLogger("uvicorn.error.research")
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -90,30 +90,14 @@ def research(req: ResearchRequest):
     if not req.topic.strip():
         raise HTTPException(status_code=400, detail="Topic must not be empty.")
 
-    config = {"configurable": {"thread_id": req.thread_id}}
-
-    initial_state = {
-        "messages":            [HumanMessage(content=req.topic)],
-        "topic":               req.topic,
-        "sub_questions":       [],
-        "search_results":      [],
-        "retrieved_docs":      [],
-        "sources":             [],
-        "synthesis":           "",
-        "final_answer":        "",
-        "turn_count":          0,
-        "retry_count":         0,
-        "error_message":       "",
-        "needs_more_research": False,
-    }
-
     try:
-        final_state = research_graph.invoke(initial_state, config=config)
+        final_state = invoke_research_turn(req.topic, req.thread_id)
     except Exception as exc:
+        logger.error("research_turn_failed reason=%s", type(exc).__name__)
         raise HTTPException(
             status_code=500,
-            detail=f"Agent execution failed: {exc}",
-        )
+            detail="Agent execution failed.",
+        ) from exc
 
     answer  = final_state.get("final_answer", "No answer generated.")
     sources = final_state.get("sources", [])

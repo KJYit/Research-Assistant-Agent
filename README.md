@@ -1,180 +1,86 @@
-# 🔬 Research Assistant Agent
+# Research Assistant Agent
 
-🚀 **Live Demo:** [https://research-assistant-agent-ten.vercel.app/](https://research-assistant-agent-ten.vercel.app/)
+A multi-turn research assistant built with LangGraph, Gemini, and Tavily. It rewrites questions for search, ranks evidence from the bundled knowledge base and the web, and generates cited answers.
 
-A multi-turn AI research agent built with **LangGraph**, **Google Gemini**, and **Tavily Search**. The agent decomposes research topics into sub-questions, retrieves information from multiple tools, evaluates its own output quality, and delivers comprehensive, cited answers.
-
----
+[Hosted web demo](https://research-assistant-agent-ten.vercel.app/) · [Two-turn demo notebook](demoNotebook.ipynb)
 
 ## Architecture
 
-```
-[START]
-   │
-   ▼
-[planner]  ──────── Decomposes topic into 2–4 sub-questions (Gemini)
-   │
-   ▼
-[researcher] ─────── Tavily web search per sub-question (Tool 1)
-   │
-   ├── retry_count > 1 → [error_handler] → [responder] → [END]
-   │
-   ▼
-[retriever] ──────── In-memory TF-IDF vector store lookup (Tool 2)
-   │
-   ▼
-[synthesizer] ────── Merges results, evaluates sufficiency (Gemini)
-   │
-   ├── needs_more_research=True → back to [planner] (max 2 re-plans)
-   │
-   ▼
-[responder] ──────── Drafts final cited answer (Gemini)
-   │
-   ▼
- [END]
-```
+![Research turn graph showing query preparation, parallel local and Tavily retrieval, rank fusion, Gemini reranking, a bounded coverage retry, and the cited response](graph.png)
 
-### Nodes (6 total)
+- **Query preparation** resolves follow-up references using recent conversation and produces up to three standalone search queries. Search providers receive only the prepared queries.
+- **Retrieval** runs local TF-IDF and Gemini embedding similarity over the 10 bundled documents, alongside Tavily search. Document vectors are cached within the running graph. A provider failure leaves results from the other paths available.
+- **Ranking** fuses ranked results, deduplicates sources, and asks Gemini to score up to 12 candidates. It selects up to five evidence snippets and validates the resulting citation numbers.
+- **Coverage** allows one targeted retry with up to two new queries and carries forward earlier evidence. If evidence remains incomplete, the response names the gaps. A reranker failure leaves coverage uncertain.
+- **State** separates the in-memory session checkpoint from the stateless turn graph. Conversations keep their message history and latest answer and sources. Query plans, candidates, and retry data stay in the turn. Server logs include stage timings, counts, and fallback categories.
 
-| Node | Responsibility |
-|------|---------------|
-| `planner` | Decomposes topic into 2–4 targeted sub-questions using Gemini |
-| `researcher` | Calls Tavily Search for each sub-question (Tool 1) |
-| `retriever` | Queries in-memory TF-IDF knowledge base (Tool 2) |
-| `synthesizer` | Merges results, deduplicates sources, evaluates sufficiency |
-| `responder` | Generates the final cited answer |
-| `error_handler` | Handles tool failures gracefully |
+## Run locally
 
-### Conditional Edges (2)
-
-1. **After `researcher`**: if `retry_count > 1` → `error_handler`; else → `retriever`
-2. **After `synthesizer`**: if `needs_more_research=True` and `turn_count < 3` → `planner`; else → `responder`
-
----
-
-## Setup
-
-### 1. Clone the repository
+Create a Python virtual environment, activate it, and install the backend dependencies.
 
 ```bash
-git clone https://github.com/KJYit/Research-Assistant-Agent.git
-cd Research-Assistant-Agent
-```
-
-### 2. Create a virtual environment
-
-```bash
-python -m venv venv
-source venv/bin/activate        # Linux/macOS
-venv\Scripts\activate           # Windows
-```
-
-### 3. Install dependencies
-
-```bash
+python -m venv .venv
+# Linux/macOS
+source .venv/bin/activate
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-### 4. Configure API keys
+Create a local `.env` file in the project root. Use a Gemini key for rewriting, embeddings, reranking, and cited answers. Set a Tavily key to enable web evidence.
 
-```bash
-cp .env.example .env
-```
-
-Edit `.env` and fill in your keys:
-
-```
+```dotenv
 GOOGLE_API_KEY=your_google_api_key_here
 TAVILY_API_KEY=your_tavily_api_key_here
 ```
 
-**Getting API keys:**
-- Google Gemini: [https://aistudio.google.com/apikey](https://aistudio.google.com/apikey) (free)
-- Tavily Search: [https://tavily.com](https://tavily.com) (free tier: 1,000 searches/month)
+Start the CLI with `python main.py`. Enter a research question, use `new` to start a fresh session, or use `quit` to exit.
 
-### 5. Run the Application
+For the web UI, run the API and frontend in separate terminals.
 
-You can run the agent in two ways: via the Command Line Interface (CLI) or via the Web UI.
-
-#### Option A: Run the CLI
-```bash
-python main.py
-```
-
-#### Option B: Run the Web UI (API + Frontend)
-**1. Start the backend API:**
-Open a terminal and run the FastAPI server:
 ```bash
 uvicorn api:app --reload
 ```
-The API will be available at `http://localhost:8000`.
 
-**2. Start the frontend:**
-Open a *new* terminal and start the React/Vite development server:
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
-Open your browser to `http://localhost:5173` to use the web interface.
 
----
+Open [the local web UI](http://localhost:5173). Send `POST /api/research` requests with `topic` and `thread_id` to receive `answer`, `sources`, and `thread_id`. Reuse the thread ID for follow-ups within the same API process.
 
-## Usage
+## Run the notebook
 
-```
-======================================================
-   🔬 Research Assistant Agent (powered by Gemini + Tavily)
-======================================================
-Commands:
-  • Type a research topic and press Enter
-  • Type 'new'  to start a fresh research session
-  • Type 'quit' or Ctrl+C to exit
-======================================================
+From the repository root, install Jupyter in the same environment as the backend and open the notebook.
 
-Research topic > How does retrieval-augmented generation work?
-
-[Planner] Decomposing topic: 'How does retrieval-augmented generation work?' (turn 1)
-[Planner] Generated 3 sub-questions:
-  1. What is retrieval-augmented generation (RAG)?
-  2. How does the retrieval component work in RAG systems?
-  3. What are the benefits of RAG over standard LLMs?
-...
-
-ANSWER
-──────────────────────────────────────────────────────────────
-Retrieval-Augmented Generation (RAG) is a technique that combines...
-
-Sources:
-[1] https://example.com/rag-paper
-[2] internal://docs/rag_overview
-──────────────────────────────────────────────────────────────
-
-Research topic > What frameworks are used to build RAG systems?  ← follow-up turn
+```bash
+python -m pip install notebook ipykernel
+jupyter notebook demoNotebook.ipynb
 ```
 
-The agent **maintains full conversation history** across turns within the same session. Follow-up questions benefit from prior research context.
+Run all cells to trace two turns and run the simulated benchmark with no credentials. The notebook uses deterministic providers by default and shows the prepared queries, ranked evidence, coverage decision, sources, and checkpoint fields. Set `USE_LIVE_PROVIDERS = True` in the setup cell to use Gemini and, when configured, Tavily for the two turns. The benchmark cell always runs the offline simulation.
 
----
+## Verify retrieval
 
-## Project Structure
+Open the [evaluation notebook](evaluationNotebook.ipynb) to run the offline checks, opt into live benchmarks, and review answers against their evidence.
 
+```bash
+python -m unittest discover -s tests -v
+python -m evaluation.retrieval_benchmark
+python -m evaluation.retrieval_benchmark --smoke
+python -m evaluation.retrieval_benchmark --live
 ```
-Research-Assistant-Agent/
-├── main.py              # CLI entry point and session management
-├── api.py               # FastAPI backend entry point
-├── graph.py             # LangGraph StateGraph definition
-├── state.py             # Shared TypedDict state schema
-├── requirements.txt
-├── .env.example
-├── frontend/            # React/Vite web user interface
-├── nodes/
-│   ├── planner.py       # Topic decomposition node
-│   ├── researcher.py    # Tavily web search node
-│   ├── retriever.py     # Vector store retrieval node
-│   ├── synthesizer.py   # Result merging + sufficiency check node
-│   ├── responder.py     # Final answer generation node
-│   └── error_handler.py # Graceful error recovery node
-└── tools/
-    └── search_tools.py  # Tavily + TF-IDF retriever implementations
-```
+
+The unit tests and default benchmark run offline with deterministic providers. The benchmark uses 24 labeled cases, including exact terms, paraphrases, follow-ups, and three out-of-corpus questions. It compares raw-topic TF-IDF, first-round hybrid ranking, and final selected evidence. Recall@5 and nDCG@5 use the 21 answerable cases. Out-of-corpus results and latency are reported separately.
+
+Use `--smoke` with Gemini and Tavily credentials to check the live provider path, including answer generation. Use `--live` with Gemini credentials to measure retrieval on the fixed local corpus. The quality gate requires both ranking metrics to meet or exceed the TF-IDF baseline and the provider path to complete without fallbacks.
+
+### Recorded live benchmark
+
+- Raw-topic TF-IDF scored **0.619 Recall@5** and **0.601 nDCG@5**.
+- First-round hybrid ranking scored **1.000 Recall@5** and **0.982 nDCG@5**.
+- Final evidence selection scored **0.929 Recall@5** and **0.948 nDCG@5**. It returned evidence for one of three out-of-corpus questions, compared with three before reranking.
+- Final retrieval averaged **22.9 seconds**, with a **64.1-second p95**. The run deliberately spaced Gemini calls, and response generation used a stub.
+
+One Gemini query rewrite returned HTTP 504 after retry, so the full run did not pass the strict quality gate. The same case passed on an isolated replay without a fallback. The live Gemini and Tavily smoke test passed.

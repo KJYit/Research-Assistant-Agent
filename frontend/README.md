@@ -1,4 +1,16 @@
-# React + TypeScript + Vite
+# Research Assistant web app
+
+Run the FastAPI backend from the repository root and leave it running while you use the web app.
+
+```sh
+python -m uvicorn api:app --port 8000
+```
+
+In a separate terminal, run `npm ci` and `npm run dev` from this directory. Open [the local web app](http://localhost:5173). If the app cannot reach the API, open [the backend health check](http://localhost:8000/health) and verify that it returns `{"status":"healthy"}`.
+
+For a hosted frontend, set `VITE_API_URL` to the HTTPS base URL of the FastAPI service before building. The API must allow the frontend origin in its CORS configuration. Rebuild after changing `VITE_API_URL`.
+
+## React + TypeScript + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
